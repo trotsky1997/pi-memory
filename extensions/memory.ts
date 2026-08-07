@@ -67,15 +67,24 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // Returns an array of error strings (empty = valid).
 function idErrors(id: string): string[] {
   const e: string[] = [];
-  if (!id) e.push("id is required");
+  if (!id) e.push("id is empty");
   else {
     const segs = id.split("/");
     if (segs.some((s) => s === "" || s === "." || s === ".."))
-      e.push(`id must be a clean relative path (no empty/./.. segments): ${JSON.stringify(id)}`);
+      e.push(`id has empty/"."/".." segments (path traversal not allowed): ${JSON.stringify(id)}`);
     if (RESERVED.has(segs[segs.length - 1].replace(/\.md$/i, "").toLowerCase()))
-      e.push(`id must not use reserved name 'index'/'log' (OKF §3.1): ${JSON.stringify(id)}`);
+      e.push(`leaf name "${segs[segs.length - 1]}" is reserved (OKF §3.1: index/log) — pick another name`);
   }
   return e;
+}
+
+// Throw a structured, actionable error so the agent can self-correct.
+function fail(mode: string, problems: string[], fix: string): never {
+  throw new Error(
+    `mem_put${mode ? ` (${mode})` : ""} failed.\n` +
+      `  problems: ${problems.join("; ")}\n` +
+      `  fix: ${fix}`,
+  );
 }
 
 // Auto-git each bundle: init on first use, then add+commit every mutation.
@@ -163,7 +172,8 @@ export default function (pi: ExtensionAPI) {
         const ie = idErrors(id);
         if (ie.length) throw new Error(`mem_get: ${ie.join("; ")}`);
         const text = await readFile(idToFile(cwd, id), "utf8").catch(() => null);
-        if (text === null) throw new Error(`mem_get: not found: ${id}`);
+        if (text === null)
+          throw new Error(`mem_get: concept "${id}" not found. Fix: call mem_get with no id to list all concepts, or check the id spelling.`);
         return { content: [{ type: "text", text }], details: {} };
       }
 
@@ -262,25 +272,24 @@ export default function (pi: ExtensionAPI) {
     },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const cwd = ctx.cwd;
-      // Normalize id + validate it before touching the filesystem.
       const id = params.id.replace(/^@/, "");
-      const errs = idErrors(id);
-      if (errs.length) throw new Error(`mem_put: ${errs.join("; ")}`);
+      const ie = idErrors(id);
+      if (ie.length)
+        fail("", ie, `use a clean relative path like "notes/auth" — no leading "/", no ".."/"." segments, leaf name must not be "index" or "log".`);
       const file = idToFile(cwd, id);
 
       // edit mode
       if (params.oldText !== undefined) {
         if (params.newText === undefined)
-          throw new Error("mem_put edit mode requires newText (got oldText only)");
-        if (!params.oldText) throw new Error("mem_put edit mode: oldText must be non-empty");
+          fail("edit", ["oldText was given but newText is missing"], `add newText with the replacement text; or drop BOTH oldText and newText and provide concept_type + body to overwrite the whole concept (write mode).`);
+        if (!params.oldText)
+          fail("edit", ["oldText is empty"], `call mem_get id="${id}" to read the current content, then copy the exact substring to replace into oldText.`);
         return withFileMutationQueue(file, async () => {
           const text = await readFile(file, "utf8").catch(() => null);
-          if (text === null) throw new Error(`mem_put: not found (edit needs existing concept): ${id}`);
-          const idx = text.indexOf(params.oldText as string);
-          if (idx === -1)
-            throw new Error(
-              `mem_put: oldText not found in ${id}. It must match exactly; if it appears more than once the first occurrence is replaced. Use read first to copy exact text.`,
-            );
+          if (text === null)
+            fail("edit", [`concept "${id}" does not exist`], `to create it, drop oldText/newText and use write mode (concept_type + body); or call mem_get with no id to list concepts and pick the right id.`);
+          if (!text.includes(params.oldText as string))
+            fail("edit", [`oldText not found verbatim in "${id}"`], `call mem_get id="${id}" to read it, then copy the exact text into oldText (whitespace/indentation must match).`);
           await writeFile(file, text.replace(params.oldText as string, params.newText as string), "utf8");
           await gitAuto(bundleRoot(cwd), `edited ${id}`);
           return { content: [{ type: "text", text: `edited ${id}` }], details: {} };
@@ -289,16 +298,21 @@ export default function (pi: ExtensionAPI) {
 
       // write mode — aggregate all field errors before writing.
       const werr: string[] = [];
-      if (!params.concept_type) werr.push("write mode requires concept_type");
-      if (params.body === undefined) werr.push("write mode requires body");
-      else if (!params.body.trim()) werr.push("write mode: body must be non-empty");
+      if (!params.concept_type) werr.push("concept_type is missing");
+      if (params.body === undefined) werr.push("body is missing");
+      else if (!params.body.trim()) werr.push("body is empty");
       if (params.stale_after && !DATE_RE.test(params.stale_after))
-        werr.push(`stale_after must be YYYY-MM-DD (got ${JSON.stringify(params.stale_after)})`);
+        werr.push(`stale_after is ${JSON.stringify(params.stale_after)}, not YYYY-MM-DD`);
       if (params.sources)
         params.sources.forEach((s, i) => {
-          if (!s.resource) werr.push(`sources[${i}].resource is required`);
+          if (!s.resource) werr.push(`sources[${i}].resource is empty`);
         });
-      if (werr.length) throw new Error(`mem_put: ${werr.join("; ")}`);
+      if (werr.length)
+        fail(
+          "write",
+          werr,
+          `provide concept_type (e.g. Note/Decision/Entity/Playbook) and a non-empty body; optional: title, description, resource (asset URI), tags, status (current/deprecated/superseded), stale_after (YYYY-MM-DD), sources[].resource (URL or bundle-relative path).`,
+        );
       const doc = buildDoc({
         type: params.concept_type,
         title: params.title,
@@ -336,7 +350,7 @@ export default function (pi: ExtensionAPI) {
       const file = idToFile(cwd, id);
       return withFileMutationQueue(file, async () => {
         await unlink(file).catch(() => {
-          throw new Error(`mem_del: not found: ${id}`);
+          throw new Error(`mem_del: concept "${id}" not found. Fix: call mem_get with no id to list concepts and pick the right id.`);
         });
         await gitAuto(bundleRoot(cwd), `deleted ${id}`);
         // ponytail: no empty-dir cleanup; no index.md/log.md regen yet.
