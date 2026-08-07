@@ -80,7 +80,10 @@ function buildDoc(p: {
   type: string;
   title?: string;
   description?: string;
+  resource?: string;
   tags?: string[];
+  status?: string;
+  stale_after?: string;
   sources?: Array<{ title?: string; resource: string }>;
   body: string;
 }): string {
@@ -88,7 +91,11 @@ function buildDoc(p: {
   lines.push(`type: ${p.type}`);
   if (p.title) lines.push(`title: ${JSON.stringify(p.title)}`);
   if (p.description) lines.push(`description: ${JSON.stringify(p.description)}`);
+  if (p.resource) lines.push(`resource: ${p.resource}`);
   if (p.tags?.length) lines.push(`tags: [${p.tags.join(", ")}]`);
+  // OKF §5 lifecycle: status (current|deprecated|superseded) + stale_after (YYYY-MM-DD).
+  if (p.status) lines.push(`status: ${p.status}`);
+  if (p.stale_after) lines.push(`stale_after: ${p.stale_after}`);
   lines.push("generated:", "  by: pi/memory", `  at: '${new Date().toISOString()}'`);
   if (p.sources?.length) {
     lines.push("sources:");
@@ -113,7 +120,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Read the OKF memory bundle for the current project (~/.pi/memories/<project>/). " +
       "If id is given → return that concept's raw markdown. Else if query is given → ripgrep search (query is an rg regex, case-insensitive) across frontmatter+body, return matching ids + line:snippet. " +
-      "Else → list all concepts (id + title), optionally filtered by type/tag. " +
+      "Else → list all concepts (id + title), optionally filtered by type/tag/status. " +
       "Concept id = file path rel bundle root without .md (e.g. 'notes/auth'). Leading @ stripped.",
     promptSnippet: "List / search / read OKF memory concepts for the current project.",
     promptGuidelines: [
@@ -124,6 +131,7 @@ export default function (pi: ExtensionAPI) {
       query: Type.Optional(Type.String({ description: "ripgrep regex (case-insensitive). Ignored when id is given." })),
       type: Type.Optional(Type.String({ description: "Filter list by concept type." })),
       tag: Type.Optional(Type.String({ description: "Filter list by tag." })),
+      status: Type.Optional(Type.String({ description: "Filter list by lifecycle status (e.g. current/deprecated/superseded)." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const cwd = ctx.cwd;
@@ -183,10 +191,12 @@ export default function (pi: ExtensionAPI) {
         const { fm } = splitFrontmatter(text);
         if (params.type && fmField(fm, "type") !== params.type) continue;
         if (params.tag && !fmTags(fm).includes(params.tag)) continue;
+        if (params.status && fmField(fm, "status") !== params.status) continue;
         const cid = fileToId(cwd, f);
         const title = fmField(fm, "title") || cid;
         const desc = fmField(fm, "description") || "";
-        out.push(`- ${cid} — ${title}${desc ? `  (${desc})` : ""}`);
+        const st = fmField(fm, "status");
+        out.push(`- ${cid} — ${title}${desc ? `  (${desc})` : ""}${st ? `  [${st}]` : ""}`);
       }
       if (!out.length) return { content: [{ type: "text", text: "(no concepts)" }], details: {} };
       out.sort();
@@ -201,7 +211,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Write or edit an OKF concept in the current project's bundle. " +
       "Edit mode (oldText+newText): exact substring replace within the existing concept (must match uniquely). " +
-      "Write mode (no oldText): create or overwrite the concept; frontmatter is built from type/title/description/tags/sources, body is the markdown body. type is required for write.",
+      "Write mode (no oldText): create or overwrite the concept; frontmatter is built from type/title/description/resource/tags/status/stale_after/sources, body is the markdown body. type is required for write.",
     promptSnippet: "Create/overwrite or patch OKF memory concepts for the current project.",
     promptGuidelines: [
       "Persist durable project knowledge (decisions, conventions, gotchas, entity docs) via mem_put; use edit mode for precise patches to long concepts.",
@@ -215,7 +225,10 @@ export default function (pi: ExtensionAPI) {
       concept_type: Type.Optional(Type.String({ description: "OKF type, e.g. Note/Decision/Entity/Playbook (write mode)." })),
       title: Type.Optional(Type.String()),
       description: Type.Optional(Type.String()),
+      resource: Type.Optional(Type.String({ description: "Canonical URI for the underlying asset (OKF §4.1)." })),
       tags: Type.Optional(Type.Array(Type.String())),
+      status: Type.Optional(Type.String({ description: "Lifecycle status: current/deprecated/superseded (OKF §5)." })),
+      stale_after: Type.Optional(Type.String({ description: "YYYY-MM-DD after which the concept may be stale (OKF §5)." })),
       sources: Type.Optional(
         Type.Array(Type.Object({ title: Type.Optional(Type.String()), resource: Type.String() })),
       ),
@@ -251,7 +264,10 @@ export default function (pi: ExtensionAPI) {
         type: params.concept_type,
         title: params.title,
         description: params.description,
+        resource: params.resource,
         tags: params.tags,
+        status: params.status,
+        stale_after: params.stale_after,
         sources: params.sources,
         body: params.body,
       });
