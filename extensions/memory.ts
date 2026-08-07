@@ -143,6 +143,21 @@ export default function (pi: ExtensionAPI) {
     await mkdir(MEM_ROOT, { recursive: true }).catch(() => {});
   });
 
+  // Urge the agent to actively use the memory tools by appending to the system prompt each turn.
+  pi.on("before_agent_start", async (event) => {
+    const urge = [
+      "## Project memory (OKF) — USE IT ACTIVELY",
+      "You have a persistent, per-project knowledge store via the `mem_get` / `mem_put` / `mem_del` tools. It survives across sessions. Treat it as your long-term memory for THIS project.",
+      "- **Before acting on a task**, call `mem_get` (no args) to list existing concepts, or `mem_get` with a `query` (rg regex) if the task touches something specific. Do NOT re-derive knowledge that is already stored.",
+      "- **Whenever you learn something durable** — a decision and its rationale, a convention, a gotcha/pitfall, an entity's shape, a workaround, a `ponytail:`-style deferral worth tracking — write it NOW with `mem_put` (write mode: id + concept_type + body; optional title/description/tags/status/stale_after). Do not wait until the end of the session.",
+      "- Mark lifecycle: `status: deprecated` for superseded decisions, `stale_after: YYYY-MM-DD` for time-sensitive ones, so future-you knows what's still current.",
+      "- Use `mem_put` edit mode (oldText/newText) for precise patches to long concepts instead of rewriting the whole file.",
+      "- Use `mem_del` when a concept is outright wrong or obsolete — don't leave dead knowledge.",
+      "Default to checking memory first and writing memory as you go. A task that ignores an existing `notes/` or `decisions/` concept is a bug.",
+    ].join("\n");
+    return { systemPrompt: event.systemPrompt + "\n\n" + urge };
+  });
+
   // ── 查: list / search / read ────────────────────────────────────────
   pi.registerTool({
     name: "mem_get",
