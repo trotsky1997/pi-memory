@@ -4,6 +4,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { readFile, writeFile, unlink, readdir, mkdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, relative, resolve, dirname, extname } from "node:path";
@@ -56,6 +57,25 @@ function fmTags(fm: string): string[] {
 }
 function clip(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+// OKF §3.1 reserved filenames, must never be concept ids at any level.
+const RESERVED = new Set(["index", "log"]);
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Validate a concept id: non-empty, no traversal, no reserved leaf.
+// Returns an array of error strings (empty = valid).
+function idErrors(id: string): string[] {
+  const e: string[] = [];
+  if (!id) e.push("id is required");
+  else {
+    const segs = id.split("/");
+    if (segs.some((s) => s === "" || s === "." || s === ".."))
+      e.push(`id must be a clean relative path (no empty/./.. segments): ${JSON.stringify(id)}`);
+    if (RESERVED.has(segs[segs.length - 1].replace(/\.md$/i, "").toLowerCase()))
+      e.push(`id must not use reserved name 'index'/'log' (OKF §3.1): ${JSON.stringify(id)}`);
+  }
+  return e;
 }
 
 // Auto-git each bundle: init on first use, then add+commit every mutation.
@@ -139,10 +159,11 @@ export default function (pi: ExtensionAPI) {
 
       // read one
       if (params.id) {
-        const text = await readFile(idToFile(cwd, params.id.replace(/^@/, "")), "utf8").catch(
-          () => null,
-        );
-        if (text === null) throw new Error(`not found: ${params.id}`);
+        const id = params.id.replace(/^@/, "");
+        const ie = idErrors(id);
+        if (ie.length) throw new Error(`mem_get: ${ie.join("; ")}`);
+        const text = await readFile(idToFile(cwd, id), "utf8").catch(() => null);
+        if (text === null) throw new Error(`mem_get: not found: ${id}`);
         return { content: [{ type: "text", text }], details: {} };
       }
 
@@ -227,7 +248,7 @@ export default function (pi: ExtensionAPI) {
       description: Type.Optional(Type.String()),
       resource: Type.Optional(Type.String({ description: "Canonical URI for the underlying asset (OKF §4.1)." })),
       tags: Type.Optional(Type.Array(Type.String())),
-      status: Type.Optional(Type.String({ description: "Lifecycle status: current/deprecated/superseded (OKF §5)." })),
+      status: Type.Optional(StringEnum(["current", "deprecated", "superseded"] as const, { description: "Lifecycle status (OKF §5)." })),
       stale_after: Type.Optional(Type.String({ description: "YYYY-MM-DD after which the concept may be stale (OKF §5)." })),
       sources: Type.Optional(
         Type.Array(Type.Object({ title: Type.Optional(Type.String()), resource: Type.String() })),
@@ -241,25 +262,43 @@ export default function (pi: ExtensionAPI) {
     },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const cwd = ctx.cwd;
-      const file = idToFile(cwd, params.id.replace(/^@/, ""));
+      // Normalize id + validate it before touching the filesystem.
+      const id = params.id.replace(/^@/, "");
+      const errs = idErrors(id);
+      if (errs.length) throw new Error(`mem_put: ${errs.join("; ")}`);
+      const file = idToFile(cwd, id);
 
       // edit mode
       if (params.oldText !== undefined) {
-        if (params.newText === undefined) throw new Error("edit requires newText");
+        if (params.newText === undefined)
+          throw new Error("mem_put edit mode requires newText (got oldText only)");
+        if (!params.oldText) throw new Error("mem_put edit mode: oldText must be non-empty");
         return withFileMutationQueue(file, async () => {
           const text = await readFile(file, "utf8").catch(() => null);
-          if (text === null) throw new Error(`not found: ${params.id}`);
-          if (!text.includes(params.oldText as string))
-            throw new Error("oldText not found (must match exactly & uniquely)");
+          if (text === null) throw new Error(`mem_put: not found (edit needs existing concept): ${id}`);
+          const idx = text.indexOf(params.oldText as string);
+          if (idx === -1)
+            throw new Error(
+              `mem_put: oldText not found in ${id}. It must match exactly; if it appears more than once the first occurrence is replaced. Use read first to copy exact text.`,
+            );
           await writeFile(file, text.replace(params.oldText as string, params.newText as string), "utf8");
-          await gitAuto(bundleRoot(cwd), `edited ${params.id}`);
-          return { content: [{ type: "text", text: `edited ${params.id}` }], details: {} };
+          await gitAuto(bundleRoot(cwd), `edited ${id}`);
+          return { content: [{ type: "text", text: `edited ${id}` }], details: {} };
         });
       }
 
-      // write mode
-      if (!params.concept_type) throw new Error("write requires concept_type (or use oldText for edit)");
-      if (params.body === undefined) throw new Error("write requires body");
+      // write mode — aggregate all field errors before writing.
+      const werr: string[] = [];
+      if (!params.concept_type) werr.push("write mode requires concept_type");
+      if (params.body === undefined) werr.push("write mode requires body");
+      else if (!params.body.trim()) werr.push("write mode: body must be non-empty");
+      if (params.stale_after && !DATE_RE.test(params.stale_after))
+        werr.push(`stale_after must be YYYY-MM-DD (got ${JSON.stringify(params.stale_after)})`);
+      if (params.sources)
+        params.sources.forEach((s, i) => {
+          if (!s.resource) werr.push(`sources[${i}].resource is required`);
+        });
+      if (werr.length) throw new Error(`mem_put: ${werr.join("; ")}`);
       const doc = buildDoc({
         type: params.concept_type,
         title: params.title,
@@ -274,8 +313,8 @@ export default function (pi: ExtensionAPI) {
       return withFileMutationQueue(file, async () => {
         await mkdir(dirname(file), { recursive: true });
         await writeFile(file, doc, "utf8");
-        await gitAuto(bundleRoot(cwd), `wrote ${params.id}`);
-        return { content: [{ type: "text", text: `wrote ${params.id} (${doc.length} bytes)` }], details: {} };
+        await gitAuto(bundleRoot(cwd), `wrote ${id}`);
+        return { content: [{ type: "text", text: `wrote ${id} (${doc.length} bytes)` }], details: {} };
       });
     },
   });
@@ -291,14 +330,17 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const cwd = ctx.cwd;
-      const file = idToFile(cwd, params.id.replace(/^@/, ""));
+      const id = params.id.replace(/^@/, "");
+      const ie = idErrors(id);
+      if (ie.length) throw new Error(`mem_del: ${ie.join("; ")}`);
+      const file = idToFile(cwd, id);
       return withFileMutationQueue(file, async () => {
         await unlink(file).catch(() => {
-          throw new Error(`not found: ${params.id}`);
+          throw new Error(`mem_del: not found: ${id}`);
         });
-        await gitAuto(bundleRoot(cwd), `deleted ${params.id}`);
+        await gitAuto(bundleRoot(cwd), `deleted ${id}`);
         // ponytail: no empty-dir cleanup; no index.md/log.md regen yet.
-        return { content: [{ type: "text", text: `deleted ${params.id}` }], details: {} };
+        return { content: [{ type: "text", text: `deleted ${id}` }], details: {} };
       });
     },
   });
