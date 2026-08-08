@@ -7,7 +7,26 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { readFile, writeFile, unlink, readdir, mkdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { exec as execCb } from "node:child_process";
+import { promisify } from "node:util";
 import { join, relative, resolve, dirname, extname } from "node:path";
+
+const exec = promisify(execCb);
+
+// ── Wiki-style internal links: [[target]] or [[target|alias]] ───────────────────
+// Concepts link to each other via [[id]]. Forward links are parsed from the body;
+// backlinks are computed at read time ("automatic bi-directional linking").
+// A target ends at ] or |, so [[auth]] ≠ concept "auth2" and [[notes/auth]] targets
+// "notes/auth" not "notes". Same extractor used both ways → consistent boundaries.
+const WIKILINK_RE = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+function wikiLinks(body: string): string[] {
+  const out: string[] = [];
+  for (const m of body.matchAll(WIKILINK_RE)) {
+    const t = m[1].trim();
+    if (t) out.push(t);
+  }
+  return out;
+}
 
 const MEM_ROOT = resolve(process.env.HOME || "", ".pi/memories");
 
@@ -19,7 +38,11 @@ function escapeCwd(cwd: string): string {
 }
 const bundleRoot = (cwd: string) => join(MEM_ROOT, escapeCwd(cwd));
 const idToFile = (cwd: string, id: string) => join(bundleRoot(cwd), id.replace(/^\/+/, "")) + ".md";
-const fileToId = (cwd: string, file: string) => relative(bundleRoot(cwd), file).replace(/\.md$/i, "");
+// Normalize '\' → '/' so concept ids are forward-slash on every platform (Windows
+// path.relative() returns backslashes, which would break [[a/b]] wikilink matching
+// and list/backlink display).
+const fileToId = (cwd: string, file: string) =>
+  relative(bundleRoot(cwd), file).replace(/\.md$/i, "").replace(/\\+/g, "/");
 
 async function* walk(dir: string): AsyncGenerator<string> {
   let entries: string[];
@@ -39,6 +62,52 @@ async function* walk(dir: string): AsyncGenerator<string> {
     if (s.isDirectory()) yield* walk(p);
     else if (extname(p).toLowerCase() === ".md") yield p;
   }
+}
+
+// Build the "Linked concepts" footer appended on read-by-id: forward links
+// (resolved ✓ / missing ✗) parsed from this concept's body, plus backlinks
+// (concepts that link TO this one). Both are computed; nothing is stored.
+// ponytail: O(all wikilinks in bundle) per read; fine for a single-user store.
+// Add a backlink index file if bundles grow large and reads get slow.
+async function linksFooter(cwd: string, id: string, text: string): Promise<string> {
+  const root = bundleRoot(cwd);
+  const { body } = splitFrontmatter(text);
+  const fw = wikiLinks(body);
+  // de-dup, preserve order
+  const seen = new Set<string>();
+  const forward = [...new Set(fw.filter((t) => !seen.has(t) && seen.add(t)))];
+
+  const back: string[] = [];
+  for await (const f of walk(root)) {
+    const otherId = fileToId(cwd, f);
+    if (otherId === id) continue;
+    const t = await readFile(f, "utf8").catch(() => "");
+    const { body: ob } = splitFrontmatter(t);
+    if (wikiLinks(ob).includes(id)) back.push(otherId);
+  }
+
+  const lines: string[] = ["", "", "---", "", "## Linked concepts", ""];
+  if (forward.length) {
+    lines.push("### Forward links (from this concept)", "");
+    for (const t of forward) {
+      const exists = existsSync(idToFile(cwd, t));
+      lines.push(`- [[${t}]] ${exists ? "✓" : "✗ (missing)"}`);
+    }
+    lines.push("");
+  } else {
+    lines.push("### Forward links", "", "_(none — add `[[other-concept-id]]` in the body to link)_", "");
+  }
+  if (back.length) {
+    lines.push("### Backlinks (concepts linking here)", "");
+    for (const b of [...new Set(back)].sort()) {
+      const t = await readFile(idToFile(cwd, b), "utf8").catch(() => "");
+      const title = fmField(splitFrontmatter(t).fm, "title") || b;
+      lines.push(`- [[${b}]] — ${title}`);
+    }
+  } else {
+    lines.push("### Backlinks", "", "_(none yet)_", "");
+  }
+  return lines.join("\n") + "\n";
 }
 
 function splitFrontmatter(text: string): { fm: string; body: string } {
@@ -153,6 +222,7 @@ export default function (pi: ExtensionAPI) {
       "- Mark lifecycle: `status: deprecated` for superseded decisions, `stale_after: YYYY-MM-DD` for time-sensitive ones, so future-you knows what's still current.",
       "- Use `mem_put` edit mode (oldText/newText) for precise patches to long concepts instead of rewriting the whole file.",
       "- Use `mem_del` when a concept is outright wrong or obsolete — don't leave dead knowledge.",
+      "- Link related concepts with `[[other-id]]` wiki links in the body (alias form `[[id|label]]`). `mem_get` by id then shows forward links (✓/✗) and auto-computed backlinks, so knowledge forms a bi-directional graph instead of isolated files.",
       "Default to checking memory first and writing memory as you go. A task that ignores an existing `notes/` or `decisions/` concept is a bug.",
     ].join("\n");
     return { systemPrompt: event.systemPrompt + "\n\n" + urge };
@@ -164,12 +234,14 @@ export default function (pi: ExtensionAPI) {
     label: "Memory · get",
     description:
       "Read the OKF memory bundle for the current project (~/.pi/memories/<project>/). " +
-      "If id is given → return that concept's raw markdown. Else if query is given → ripgrep search (query is an rg regex, case-insensitive) across frontmatter+body, return matching ids + line:snippet. " +
+      "If id is given → return that concept's raw markdown PLUS a `## Linked concepts` footer showing forward links `[[id]]` (✓ resolved / ✗ missing) and backlinks (concepts that link here). " +
+      "Else if query is given → ripgrep search (query is an rg regex, case-insensitive) across frontmatter+body, return matching ids + line:snippet. " +
       "Else → list all concepts (id + title), optionally filtered by type/tag/status. " +
-      "Concept id = file path rel bundle root without .md (e.g. 'notes/auth'). Leading @ stripped.",
+      "Concept id = file path rel bundle root without .md (e.g. 'notes/auth'). Leading @ stripped. Concepts link to each other via `[[other-id]]` wiki links in the body (alias form `[[id|label]]` supported).",
     promptSnippet: "List / search / read OKF memory concepts for the current project.",
     promptGuidelines: [
       "Before re-deriving project knowledge (decisions, conventions, entity docs), call mem_get to recall what's already persisted.",
+      "Connect related concepts with `[[other-concept-id]]` wiki links in the body — backlinks are surfaced automatically in the read footer.",
     ],
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Concept id to read. Omit to search/list." })),
@@ -182,7 +254,7 @@ export default function (pi: ExtensionAPI) {
       const cwd = ctx.cwd;
       const root = bundleRoot(cwd);
 
-      // read one
+      // read one — raw markdown + a computed Linked-concepts footer (forward links + backlinks).
       if (params.id) {
         const id = params.id.replace(/^@/, "");
         const ie = idErrors(id);
@@ -191,7 +263,8 @@ export default function (pi: ExtensionAPI) {
         const text = await readFile(idToFile(cwd, id), "utf8").catch(() => null);
         if (text === null)
           throw new Error(`mem_get failed.\n  problems: concept "${id}" not found.\n  fix: call mem_get with no id to list all concepts, or check the id spelling.`);
-        return { content: [{ type: "text", text }], details: {} };
+        const footer = await linksFooter(cwd, id, text);
+        return { content: [{ type: "text", text: text + footer }], details: {} };
       }
 
       // search — query is an rg regex, case-insensitive.

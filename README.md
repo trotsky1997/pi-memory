@@ -35,6 +35,22 @@ Example: `/root/myproject` → `root---myproject`.
 
 Every concept is a markdown file with YAML frontmatter. The only spec-required field is `type`. `mem_put` also writes `title` / `description` / `tags` / `generated` (by `pi/memory`, ISO timestamp) / `sources` when provided. Concepts link to each other via normal markdown links.
 
+## Wiki links & automatic backlinks
+
+Concepts form a bi-directional graph via Obsidian-style **wiki links**. Write `[[other-concept-id]]` (or `[[other-concept-id|alias]]`) anywhere in a concept's body to link to it.
+
+```markdown
+# notes/auth
+Auth uses [[notes/oauth]] and [[notes/session|sessions]]. See also [[missing-thing]].
+```
+
+`mem_get` by id returns the raw markdown plus a computed **`## Linked concepts`** footer:
+
+- **Forward links** — every `[[target]]` found in the body, marked `✓` if the target concept exists or `✗ (missing)` if it dangles.
+- **Backlinks** — every other concept whose body links **to** this one (auto-computed, never stored).
+
+Target boundaries are exact: `[[auth]]` does not match concept `auth2`, and `[[notes/auth]]` targets `notes/auth`, not `notes`. Backlinks are scanned across the whole bundle at read time — fine for a single-user store; add an index file if a bundle grows large enough that reads get slow.
+
 ## Install
 
 ```bash
