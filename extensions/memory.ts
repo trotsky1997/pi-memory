@@ -10,6 +10,7 @@ import { existsSync } from "node:fs";
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { join, relative, resolve, dirname, extname } from "node:path";
+import { spawn } from "node:child_process";
 
 const exec = promisify(execCb);
 
@@ -29,6 +30,31 @@ function wikiLinks(body: string): string[] {
 }
 
 const MEM_ROOT = resolve(process.env.HOME || "", ".pi/memories");
+
+/**
+ * Spawn a binary directly (no `bash -c`) and return {stdout, stderr, code}.
+ * Inline historically used a bare `exec(shellString)` that was never defined —
+ * it threw `exec is not defined`, which broke mem_get search outright and made
+ * gitAuto fail silently (swallowed by its catch). Spawning the binary directly
+ * with an argv array avoids relying on `/bin/bash` (absent from the node
+ * process view on Windows) and avoids shell-quoting the rg regex / git paths.
+ */
+function exec(bin: string, args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
+  return new Promise((resolvePromise) => {
+    const child = spawn(bin, args, { shell: false, encoding: "utf-8", maxBuffer: 8 * 1024 * 1024 });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (d) => { stdout += d; });
+    child.stderr?.on("data", (d) => { stderr += d; });
+    child.on("error", (err) => {
+      // binary missing / failed to spawn — surface as a real error (code -1).
+      resolvePromise({ stdout, stderr: stderr || `${bin}: ${err.message}`, code: -1 });
+    });
+    child.on("close", (code) => {
+      resolvePromise({ stdout, stderr, code: code ?? -1 });
+    });
+  });
+}
 
 // '/' → '---', other unsafe chars → '_'. Human-readable & reversible-ish.
 // e.g. /root/myproject → root---myproject.
@@ -164,12 +190,12 @@ function fail(mode: string, problems: string[], fix: string): never {
 async function gitAuto(root: string, message: string): Promise<void> {
   try {
     if (!existsSync(join(root, ".git"))) {
-      await exec(`git init -q ${JSON.stringify(root)}`);
-      await exec(`git -C ${JSON.stringify(root)} config user.email pi-memory@local`);
-      await exec(`git -C ${JSON.stringify(root)} config user.name "pi/memory"`);
+      await exec("git", ["init", "-q", root]);
+      await exec("git", ["-C", root, "config", "user.email", "pi-memory@local"]);
+      await exec("git", ["-C", root, "config", "user.name", "pi/memory"]);
     }
-    await exec(`git -C ${JSON.stringify(root)} add -A`);
-    await exec(`git -C ${JSON.stringify(root)} commit -q -m ${JSON.stringify(message)}`);
+    await exec("git", ["-C", root, "add", "-A"]);
+    await exec("git", ["-C", root, "commit", "-q", "-m", message]);
   } catch {
     // nothing to commit, or git missing — file op already succeeded, git is best-effort.
   }
@@ -271,17 +297,25 @@ export default function (pi: ExtensionAPI) {
       // ponytail: shells out to ripgrep; no JS fallback. rg required at runtime.
       if (params.query) {
         let stdout = "";
+        let rgCode = 0;
+        let rgErr = "";
         try {
-          const { stdout: out } = await exec(
-            `rg -i -n --no-heading -- ${JSON.stringify(params.query)} ${JSON.stringify(root)}`,
-            { maxBuffer: 4 * 1024 * 1024 },
-          );
-          stdout = out;
+          const out = await exec("rg", ["-i", "-n", "--no-heading", "--", params.query, root]);
+          stdout = out.stdout;
+          rgCode = out.code;
+          rgErr = out.stderr;
         } catch (e: unknown) {
-          // rg exits 1 on no matches
-          if ((e as { code?: number }).code === 1)
-            return { content: [{ type: "text", text: `(no matches for /${params.query}/)` }], details: {} };
-          throw new Error(`mem_get (search) failed.\n  problems: ripgrep error — ${String((e as Error).message || e)}\n  fix: check that the query is a valid regex; rg is required at runtime.`);
+          // spawn itself failed (rg missing) — exec resolves with code -1, but
+          // guard against any synchronous throw too.
+          rgCode = -1;
+          rgErr = String((e as Error).message || e);
+        }
+        // rg exits 1 on no matches — not an error.
+        if (rgCode === 1) {
+          return { content: [{ type: "text", text: `(no matches for /${params.query}/)` }], details: {} };
+        }
+        if (rgCode !== 0) {
+          throw new Error(`mem_get (search) failed.\n  problems: ripgrep error (exit ${rgCode}) — ${rgErr || "no stderr"}\n  fix: check that the query is a valid regex; rg is required at runtime.`);
         }
         // parse `path:line:match` lines, group by concept id
         const byId = new Map<string, string[]>();
