@@ -7,12 +7,8 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { readFile, writeFile, unlink, readdir, mkdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { exec as execCb } from "node:child_process";
-import { promisify } from "node:util";
 import { join, relative, resolve, dirname, extname } from "node:path";
 import { spawn } from "node:child_process";
-
-const exec = promisify(execCb);
 
 // ── Wiki-style internal links: [[target]] or [[target|alias]] ───────────────────
 // Concepts link to each other via [[id]]. Forward links are parsed from the body;
